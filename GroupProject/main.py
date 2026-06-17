@@ -4,7 +4,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import joblib
-
+from sklearn.metrics import r2_score, mean_absolute_error
 # Set Page Configuration
 st.set_page_config(page_title="Malaysia Property AI", page_icon="🏢", layout="wide")
 
@@ -76,29 +76,31 @@ def load_ai_engine():
         le_state = joblib.load("le_state.pkl")
         le_type = joblib.load("le_type.pkl")
         le_tenure = joblib.load("le_tenure.pkl")
+        le_urban = joblib.load("le_urban.pkl")
 
         rf = joblib.load("rf_model.pkl")
         xgb = joblib.load("xgb_model.pkl")
         lr = joblib.load("lr_model.pkl")
 
-        return le_state, le_type, le_tenure, rf, xgb, lr
+        return le_state, le_type, le_tenure, le_urban, rf, xgb, lr
     except Exception:
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
 
-def predict_market_value(df_segment, engine_type):
+def predict_market_value(df_segment, engine_type, user_sqft, user_urban):
     if df_segment.empty:
         return 0.0, [0.0] * 37
 
-    # Establish the real-world baseline price from the filtered dataset
-    actual_base_price = df_segment['median_price'].median()
-
     # Load AI assets
-    le_state, le_type, le_tenure, rf, xgb, lr = load_ai_engine()
+    le_state, le_type, le_tenure, le_urban_enc, rf, xgb, lr = load_ai_engine()
 
     if le_state is None:
-        st.error("Warning: AI model files missing. Please run train_model.py first.")
-        return actual_base_price, [actual_base_price] * 37
+        st.error("AI model files missing. Please run train_model.py first.")
+        return 0.0, [0.0] * 37
+
+    # Calculate realistic base price using the user's specific size and local segment's median Price Per Sqft
+    segment_psf = df_segment['median_psf'].median()
+    actual_base_price = user_sqft * segment_psf
 
     # Select the model based on user input
     if "Random Forest" in engine_type:
@@ -113,6 +115,9 @@ def predict_market_value(df_segment, engine_type):
     rep_tenure = df_segment['simplified_tenure'].mode()[0]
     rep_type = df_segment['simplified_type'].mode()[0]
 
+    # Use user's selected urban/rural status if specific, otherwise use segment mode
+    target_urban = user_urban if user_urban != "All" else df_segment['urban_rural'].mode()[0]
+
     # Helper function to prevent unseen label errors
     def safe_encode(le, val):
         if val in le.classes_:
@@ -122,17 +127,18 @@ def predict_market_value(df_segment, engine_type):
     s_enc = safe_encode(le_state, rep_state)
     t_enc = safe_encode(le_type, rep_type)
     ten_enc = safe_encode(le_tenure, rep_tenure)
+    ur_enc = safe_encode(le_urban_enc, target_urban)
 
     # Global macro trend parameter based on NAPIC injection
     macro_trend = 0.035
-
     raw_predictions = []
 
     # Iterate through 36 months to generate independent AI predictions
     for m in range(37):
-        # Must match the exact 5-feature structure used in training
-        features = pd.DataFrame([[s_enc, t_enc, ten_enc, macro_trend, m]],
-                                columns=['state', 'type', 'tenure', 'macro_trend', 'month_offset'])
+        # Matches the exact 7-feature structure used in training
+        features = pd.DataFrame([[s_enc, t_enc, ten_enc, ur_enc, user_sqft, macro_trend, m]],
+                                columns=['state', 'type', 'tenure', 'urban_rural', 'built_up_sqft', 'macro_trend',
+                                         'month_offset'])
 
         try:
             pred = model.predict(features)[0]
@@ -155,6 +161,49 @@ def predict_market_value(df_segment, engine_type):
     return actual_base_price, final_trajectory
 
 
+def calculate_segment_metrics(df_segment):
+    # We only need 1 row to calculate Percentage Error!
+    if len(df_segment) < 1:
+        return None
+
+    le_state, le_type, le_tenure, le_urban, rf, xgb, lr = load_ai_engine()
+    if rf is None:
+        return None
+
+    def safe_transform(le, val_list):
+        known = set(le.classes_)
+        return [le.transform([v])[0] if v in known else 0 for v in val_list]
+
+    X_eval = pd.DataFrame()
+    X_eval['state'] = safe_transform(le_state, df_segment['state'])
+    X_eval['type'] = safe_transform(le_type, df_segment['simplified_type'])
+    X_eval['tenure'] = safe_transform(le_tenure, df_segment['simplified_tenure'])
+    X_eval['urban_rural'] = safe_transform(le_urban, df_segment['urban_rural'])
+    X_eval['built_up_sqft'] = df_segment['built_up_sqft'].values
+    X_eval['macro_trend'] = 0.035
+    X_eval['month_offset'] = 0
+
+    y_true = df_segment['median_price'].values
+
+    results = {}
+    from sklearn.metrics import mean_absolute_error
+
+    for name, model in [("RF", rf), ("XGB", xgb), ("LR", lr)]:
+        preds = model.predict(X_eval)
+
+        # Calculate Mean Absolute Percentage Error (MAPE)
+        # We add 1e-9 to prevent division by zero errors
+        mape = np.mean(np.abs((y_true - preds) / (y_true + 1e-9)))
+
+        # Convert MAPE to a highly intuitive Accuracy Percentage
+        accuracy_pct = max(0.0, 100.0 - (mape * 100))
+
+        mae = mean_absolute_error(y_true, preds)
+
+        results[name] = {"accuracy": accuracy_pct, "mae": mae}
+
+    return results
+
 # Navigation Logic
 if 'current_page' not in st.session_state:
     st.session_state.current_page = 'welcome'
@@ -172,9 +221,8 @@ def render_welcome_page():
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.write("")
-        # FIXED: Replaced use_column_width with use_container_width to remove the deprecation warning
         st.image("https://img.icons8.com/clouds/400/000000/city-buildings.png", use_container_width=True)
-        st.markdown("<h1 style='text-align: center;'>Malaysia Smart Home Valuation System</h1>", unsafe_allow_html=True)
+        st.markdown("<h1 style='text-align: center;'>Malaysia House Valuation System</h1>", unsafe_allow_html=True)
         st.button("Enter Advanced Data Hub", on_click=go_to_dashboard, use_container_width=True, type="primary")
 
 
@@ -195,6 +243,13 @@ def render_dashboard():
     types_list = ["All"] + sorted(df['simplified_type'].unique().tolist())
     selected_type = st.sidebar.selectbox("Select Property Type:", options=types_list)
 
+    # NEW IMPUT: Urban/Rural and House Size
+    st.sidebar.markdown("---")
+    st.sidebar.header("Property Specifics")
+    selected_urban = st.sidebar.selectbox("Select Area Type:", ["All", "Urban", "Rural"])
+    input_sqft = st.sidebar.number_input("Enter House Size (Sqft):", min_value=100.0, max_value=20000.0, value=1200.0,
+                                         step=100.0)
+
     st.sidebar.markdown("---")
     st.sidebar.header("Core Prediction Configuration")
     active_engine = st.sidebar.selectbox(
@@ -207,51 +262,50 @@ def render_dashboard():
     if selected_state != "All": filtered_df = filtered_df[filtered_df['state'] == selected_state]
     if selected_tenure != "All": filtered_df = filtered_df[filtered_df['simplified_tenure'] == selected_tenure]
     if selected_type != "All": filtered_df = filtered_df[filtered_df['simplified_type'] == selected_type]
+    if selected_urban != "All": filtered_df = filtered_df[filtered_df['urban_rural'] == selected_urban]
 
     st.title("Property Big Data Smart Matrix Console")
     st.write(f"Active AI Engine: `{active_engine}` | Filtered Data Pool: **{len(filtered_df):,} Rows**")
 
     # Tabs Configuration
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Tab 1: Global Market",
-        "Tab 2: Filter & Prediction",
-        "Tab 3: AI Engine Collision",
-        "Tab 4: Raw Underlying Data",
-        "Tab 5: Bank Mortgage Rates"
+        "Tab 1: Whole Malaysia Market",
+        "Tab 2: Specific House Prediction",
+        "Tab 3: AI Engine Comparison",
+        "Tab 4: Raw Data",
+        "Tab 5: Bank Links"
     ])
 
     with tab1:
-        st.subheader("Malaysia Real Estate Transaction Market Monitoring")
+        st.subheader("Malaysia Transaction Market ")
         m1, m2, m3 = st.columns(3)
         m1.metric("Total System Sample Volume", f"{len(df):,} Rows")
-        m2.metric("National Median Market Price", f"RM {df['median_price'].median():,.2f}")
-        m3.metric("National Average Price Per Sqft", f"RM {df['median_psf'].mean():,.2f}")
+        m2.metric("Median Market Price", f"RM {df['median_price'].median():,.2f}")
+        m3.metric("Average Price Per Sqft", f"RM {df['median_psf'].mean():,.2f}")
 
         c1, c2 = st.columns(2)
         with c1:
-            fig1 = px.pie(df, names='state', values='median_price', title="National Transaction Value Market Share",
-                          hole=0.4)
+            fig1 = px.pie(df, names='state', values='median_price', title="Transaction Value Market Share", hole=0.4)
             st.plotly_chart(fig1, use_container_width=True)
         with c2:
             fig2 = px.box(df, x='simplified_type', y='median_price', color='simplified_type',
-                          title="National Core Property Price Range")
+                          title="Core Property Price Range")
             st.plotly_chart(fig2, use_container_width=True)
 
     with tab2:
         st.subheader("Target Segment AI Value Prediction Inference")
-        st.write(f"Currently Selected Target Subset Samples: **{len(filtered_df):,} Rows**")
+        st.write(
+            f"Evaluating a **{input_sqft:,.0f} sqft** property. Target Subset Samples: **{len(filtered_df):,} Rows**")
 
         if filtered_df.empty:
             st.warning("No historical transaction data for this combination. Please relax the sidebar filters.")
         else:
-            current_val, trajectory = predict_market_value(filtered_df, active_engine)
+            # Pass the new user inputs into the prediction function
+            current_val, trajectory = predict_market_value(filtered_df, active_engine, input_sqft, selected_urban)
 
             f1, f2 = st.columns([1, 1.2])
             with f1:
-                st.markdown("### Engine Dynamic Calculation Benchmark")
                 st.metric("Reasonable Asset Valuation (Base Price)", f"RM {current_val:,.2f}")
-                st.info(
-                    f"Note: Forward-looking trajectories are simulated purely by `{active_engine}` using historical NAPIC macro-data integration.")
 
                 st.markdown("#### 36-Month Detailed Extrapolation")
                 if current_val > 0:
@@ -275,18 +329,17 @@ def render_dashboard():
                     line=dict(width=4, color='#1F77B4'),
                     hovertemplate="<b>%{x}</b><br>Estimated Value: RM %{y:,.0f}<extra></extra>"
                 ))
-                fig_line.update_layout(title=f"36-Month Asset Extrapolation Trajectory ({active_engine})",
-                                       yaxis_title="Valuation (RM)")
+                fig_line.update_layout(title="36-Month Asset Extrapolation Trajectory", yaxis_title="Valuation (RM)")
                 st.plotly_chart(fig_line, use_container_width=True)
 
     with tab3:
-        st.subheader("Multi-Algorithm Model Fit & Value Extrapolation Comparison")
+        st.subheader("Comparison of Three Different Engines")
         if filtered_df.empty:
             st.warning("No data available for collision.")
         else:
-            _, res_rf = predict_market_value(filtered_df, "Random Forest (Recommended)")
-            _, res_xgb = predict_market_value(filtered_df, "XGBoost")
-            _, res_lr = predict_market_value(filtered_df, "Linear Regression")
+            _, res_rf = predict_market_value(filtered_df, "Random Forest (Recommended)", input_sqft, selected_urban)
+            _, res_xgb = predict_market_value(filtered_df, "XGBoost", input_sqft, selected_urban)
+            _, res_lr = predict_market_value(filtered_df, "Linear Regression", input_sqft, selected_urban)
 
             timeline_nodes = ["Current"] + [f"Month {i}" for i in range(1, 37)]
             fig_comp = go.Figure()
@@ -299,14 +352,45 @@ def render_dashboard():
             fig_comp.update_layout(title="AI Models: 36-Month Extrapolation", yaxis_title="Estimated Total Price (RM)")
             st.plotly_chart(fig_comp, use_container_width=True)
 
-            # ADDED: Explanation of the different AI Models for the user
-            st.info("""
-            **💡 Understanding the AI Engine Collision Chart:**
-            * **Random Forest (Recommended):** Uses multiple decision trees to find complex, non-linear patterns in the property market. It usually provides the most balanced, stable, and realistic trajectory.
-            * **XGBoost:** A highly optimized, aggressive gradient boosting algorithm. It is very sensitive to micro-trends and might show sharper growth or depreciation curves.
-            * **Linear Regression:** The traditional baseline model. It assumes a straight-line constant growth based on historical averages, lacking the dynamic market nuance of the other two advanced models.
-            """)
+            # --- DYNAMIC METRICS UI ---
+            st.markdown("### 📊 Dynamic Localized Model Performance")
+            st.write(
+                f"These metrics represent real-time accuracy specifically for the **{len(filtered_df)}** properties matching your filter.")
 
+            metrics = calculate_segment_metrics(filtered_df)
+
+            if metrics is None:
+                st.warning("⚠️ No data available to calculate localized metrics.")
+            else:
+                m_col1, m_col2, m_col3 = st.columns(3)
+
+                with m_col1:
+                    st.success("**🌳 Random Forest**")
+                    st.metric("Localized Accuracy", f"{metrics['RF']['accuracy']:.2f}%")
+                    st.metric("Localized MAE", f"RM {metrics['RF']['mae']:,.0f}")
+
+                with m_col2:
+                    st.info("**⚡ XGBoost**")
+                    st.metric("Localized Accuracy", f"{metrics['XGB']['accuracy']:.2f}%")
+                    st.metric("Localized MAE", f"RM {metrics['XGB']['mae']:,.0f}")
+
+                with m_col3:
+                    st.warning("**📈 Linear Regression**")
+                    st.metric("Localized Accuracy", f"{metrics['LR']['accuracy']:.2f}%")
+                    st.metric("Localized MAE", f"RM {metrics['LR']['mae']:,.0f}")
+
+            st.markdown("---")
+
+            st.info("""
+            **💡 How to Interpret the Model Performance:**
+            * **🎯 Localized Accuracy:** This shows how close the AI's predicted price is to the actual real-world market price. For example, a 95% accuracy means the AI's prediction is, on average, only 5% away from the actual transaction price. *(Higher is better)*.
+            * **💰 Localized MAE (Mean Absolute Error):** This represents the average error margin in Ringgit Malaysia (RM). If the MAE is RM 20,000, it means the AI's estimates are typically within a RM 20,000 range above or below the exact true property value. *(Lower is better)*.
+            
+            **⚙️ Engine Characteristics:**
+            * **Random Forest:** Uses multiple decision trees to find complex, non-linear patterns. It provides a highly balanced and stable trajectory.
+            * **XGBoost:** A highly optimized gradient boosting algorithm. It is very sensitive to micro-trends and often performs best on specific local segments.
+            * **Linear Regression:** The traditional baseline model. It assumes a straight-line constant growth, lacking the dynamic market nuance of the advanced tree models.
+            """)
     with tab4:
         st.subheader("Filtered Property Underlying Relational Transaction Snapshot")
         csv_buffer = filtered_df.to_csv(index=False).encode('utf-8')
@@ -315,7 +399,7 @@ def render_dashboard():
         st.dataframe(filtered_df, use_container_width=True)
 
     with tab5:
-        st.subheader("Malaysia Core Commercial Bank Home Loan Direct Access")
+        st.subheader("Link to Malaysia Bank Home Loans")
         b1, b2, b3 = st.columns(3)
         with b1:
             st.markdown(
@@ -327,7 +411,7 @@ def render_dashboard():
                 unsafe_allow_html=True)
         with b3:
             st.markdown(
-                """<div style='border: 1px solid #E0E0E0; padding: 20px; border-radius: 10px; text-align: center; background-color: #E8F5E9;'><h3 style='color: #43A047;'>RHB Bank</h3><a href='https://www.rhbgroup.com/personal/loans/home/index.html' target='_blank'><button style='background-color: #43A047; color: white; border: none; padding: 10px; border-radius: 5px; cursor: pointer;'>Visit Official Website</button></a></div>""",
+                """<div style='border: 1px solid #E0E0E0; padding: 20px; border-radius: 10px; text-align: center; background-color: #E8F5E9;'><h3 style='color: #43A047;'>RHB Bank</h3><a href='https://www.rhbgroup.com/index.html' target='_blank'><button style='background-color: #43A047; color: white; border: none; padding: 10px; border-radius: 5px; cursor: pointer;'>Visit Official Website</button></a></div>""",
                 unsafe_allow_html=True)
 
 
