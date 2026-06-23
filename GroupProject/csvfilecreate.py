@@ -29,4 +29,4 @@ try:
 except Exception as e:
     print(f"\n❌ Download Failed。Error: {e}")
     print(
-        "💡 Hint:Check Your Wifi if u mee the problem of out of connection time! ")
+        "💡 Hint:Check Your Wifi if u meet the problem of out of connection time! ")
